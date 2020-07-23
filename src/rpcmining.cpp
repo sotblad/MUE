@@ -112,90 +112,67 @@ UniValue getgenerate(const UniValue& params, bool fHelp)
     return GetBoolArg("-gen", false);
 }
 
-UniValue generate(const JSONRPCRequest& request)
+UniValue generate(const UniValue& params, bool fHelp)
 {
-    if (request.fHelp || request.params.size() < 1 || request.params.size() > 1)
-        throw std::runtime_error(
+    if (fHelp || params.size() < 1 || params.size() > 1)
+        throw runtime_error(
             "generate numblocks\n"
             "\nMine blocks immediately (before the RPC call returns)\n"
             "\nNote: this function can only be used on the regtest network\n"
-
-            "\nArguments:\n"
-            "1. numblocks    (numeric, required) How many blocks to generate.\n"
-
+            "1. numblocks    (numeric) How many blocks are generated immediately.\n"
             "\nResult\n"
             "[ blockhashes ]     (array) hashes of blocks generated\n"
-
             "\nExamples:\n"
             "\nGenerate 11 blocks\n"
             + HelpExampleCli("generate", "11")
         );
 
-    if (!Params().IsRegTestNet())
+    if (!Params().MineBlocksOnDemand())
         throw JSONRPCError(RPC_METHOD_NOT_FOUND, "This method can only be used on regtest");
 
-    const int nGenerate = request.params[0].get_int();
+    int nHeightStart = 0;
     int nHeightEnd = 0;
     int nHeight = 0;
+    int nGenerate = params[0].get_int();
+
+    CScript coinbaseScript;
+    GetMainSignals().ScriptForMining(coinbaseScript);
+
+    //throw an error if no script was provided
+    if (!coinbaseScript.size())
+        throw JSONRPCError(RPC_INTERNAL_ERROR, "No coinbase script available (mining requires a wallet)");
 
     {   // Don't keep cs_main locked
         LOCK(cs_main);
-        nHeight = chainActive.Height();
-        nHeightEnd = nHeight + nGenerate;
+        nHeightStart = chainActive.Height();
+        nHeight = nHeightStart;
+        nHeightEnd = nHeightStart+nGenerate;
     }
-
-    const Consensus::Params& consensus = Params().GetConsensus();
-    bool fPoS = consensus.NetworkUpgradeActive(nHeight + 1, Consensus::UPGRADE_POS);
-
-    if (fPoS) {
-        // If we are in PoS, wallet must be unlocked.
-        EnsureWalletIsUnlocked();
-    }
-
-    UniValue blockHashes(UniValue::VARR);
-    CReserveKey reservekey(pwalletMain);
     unsigned int nExtraNonce = 0;
-    while (nHeight < nHeightEnd && !ShutdownRequested())
+    UniValue blockHashes(UniValue::VARR);
+    while (nHeight < nHeightEnd)
     {
-        std::unique_ptr<CBlockTemplate> pblocktemplate(fPoS ?
-                                                       CreateNewBlock(CScript(), pwalletMain, fPoS) :
-                                                       CreateNewBlockWithKey(reservekey, pwalletMain));
-        if (!pblocktemplate.get()) break;
+        auto_ptr<CBlockTemplate> pblocktemplate(CreateNewBlock(coinbaseScript));
+        if (!pblocktemplate.get())
+            throw JSONRPCError(RPC_INTERNAL_ERROR, "Couldn't create new block");
         CBlock *pblock = &pblocktemplate->block;
-
-        if(!fPoS) {
-            {
-                LOCK(cs_main);
-                IncrementExtraNonce(pblock, chainActive.Tip(), nExtraNonce);
-            }
-            while (pblock->nNonce < std::numeric_limits<uint32_t>::max() &&
-                    !CheckProofOfWork(pblock->GetHash(), pblock->nBits)) {
-                ++pblock->nNonce;
-            }
-            if (ShutdownRequested()) break;
-            if (pblock->nNonce == std::numeric_limits<uint32_t>::max()) continue;
+        {
+            LOCK(cs_main);
+            IncrementExtraNonce(pblock, chainActive.Tip(), nExtraNonce);
         }
-
+        while (!CheckProofOfWork(pblock->GetHash(), pblock->nBits, Params().GetConsensus())) {
+            // Yes, there is a chance every nonce could fail to satisfy the -regtest
+            // target -- 1 in 2^(2^32). That ain't gonna happen.
+            ++pblock->nNonce;
+        }
         CValidationState state;
-        if (!ProcessNewBlock(state, nullptr, pblock))
+        if (!ProcessNewBlock(state, NULL, pblock, true, NULL))
             throw JSONRPCError(RPC_INTERNAL_ERROR, "ProcessNewBlock, block not accepted");
-
         ++nHeight;
         blockHashes.push_back(pblock->GetHash().GetHex());
-
-        // Check PoS if needed.
-        if (!fPoS)
-            fPoS = consensus.NetworkUpgradeActive(nHeight + 1, Consensus::UPGRADE_POS);
     }
-
-    const int nGenerated = blockHashes.size();
-    if (nGenerated == 0 || (!fPoS && nGenerated < nGenerate))
-        throw JSONRPCError(RPC_INTERNAL_ERROR, "Couldn't create new blocks");
-
     return blockHashes;
 }
-
-
 
 UniValue setgenerate(const UniValue& params, bool fHelp)
 {
